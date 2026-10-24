@@ -703,10 +703,7 @@ class StateManager:
 
     def import_cloud_request_logs(self, logs_data):
         with self.lock:
-            items = logs_data.get("items", []) if isinstance(logs_data, dict) else logs_data
-            if not items:
-                return 0
-            
+            items = logs_data.get("items", []) if isinstance(logs_data, dict) else (logs_data if isinstance(logs_data, list) else [])
             now = time.time()
             five_hours_ago = now - 5 * 3600
 
@@ -974,6 +971,26 @@ class OpenCodeSyncEngine:
                     break
         return result
 
+    def _api_get(self, endpoint, preferred_tokens, base_headers=None):
+        if base_headers is None:
+            base_headers = {}
+        for tok in preferred_tokens:
+            if not tok:
+                continue
+            try:
+                headers = {**base_headers, "Authorization": f"Bearer {tok}"}
+                req = urllib.request.Request(endpoint, headers=headers)
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if resp.status == 200:
+                        return json.loads(resp.read().decode("utf-8")), None
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    continue
+                return None, f"HTTP {e.code}"
+            except Exception as e:
+                return None, str(e)
+        return None, "Authorization required"
+
     def sync_now(self, force_catalog=False):
         now_ts = time.time()
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1011,22 +1028,7 @@ class OpenCodeSyncEngine:
             base_headers["x-org-id"] = org_id
 
         def api_get(endpoint, preferred_tokens):
-            for tok in preferred_tokens:
-                if not tok:
-                    continue
-                try:
-                    headers = {**base_headers, "Authorization": f"Bearer {tok}"}
-                    req = urllib.request.Request(endpoint, headers=headers)
-                    with urllib.request.urlopen(req, timeout=10) as resp:
-                        if resp.status == 200:
-                            return json.loads(resp.read().decode("utf-8")), None
-                except urllib.error.HTTPError as e:
-                    if e.code in (401, 403):
-                        continue
-                    return None, f"HTTP {e.code}"
-                except Exception as e:
-                    return None, str(e)
-            return None, "Authorization required"
+            return self._api_get(endpoint, preferred_tokens, base_headers)
 
         subsystems = {
             "models": {"status": "pending", "message": "", "last_sync": None},
@@ -1058,6 +1060,7 @@ class OpenCodeSyncEngine:
         max_pages = 25
         page_count = 0
         five_hours_ago = now_ts - 5 * 3600
+        reached_window_end = False
 
         while page_count < max_pages:
             page_count += 1
@@ -1070,10 +1073,12 @@ class OpenCodeSyncEngine:
                 logs_err = err
                 break
             if not data_logs:
+                logs_err = "Empty response from request-logs API"
                 break
 
             items = data_logs.get("items", []) if isinstance(data_logs, dict) else (data_logs if isinstance(data_logs, list) else [])
             if not items:
+                reached_window_end = True
                 break
 
             logs_items.extend(items)
@@ -1081,27 +1086,33 @@ class OpenCodeSyncEngine:
             # Check oldest item timestamp on page
             oldest_on_page = min((it.get("startedAt") or 0) / 1000.0 for it in items)
             if oldest_on_page < five_hours_ago:
-                # Reached past the 5h sliding window
+                reached_window_end = True
                 break
 
             next_cursor = data_logs.get("nextCursor") if isinstance(data_logs, dict) else None
             if not next_cursor:
+                reached_window_end = True
                 break
             cursor = next_cursor
 
-        if logs_items:
+        # Guard against incomplete pagination: do not overwrite authoritative counters with partial results
+        pagination_incomplete = False
+        if logs_err:
+            pagination_incomplete = True
+            err_reason = f"Request logs: {logs_err}"
+        elif not reached_window_end and page_count >= max_pages:
+            pagination_incomplete = True
+            err_reason = f"Request logs: Max pagination limit ({max_pages} pages) reached before 5h window boundary"
+            logs_err = f"Max pagination limit ({max_pages} pages) reached before 5h boundary"
+
+        if pagination_incomplete:
+            subsystems["logs"]["status"] = "error"
+            subsystems["logs"]["message"] = f"Incomplete logs ({logs_err}); retained previous data"
+            errors.append(err_reason)
+        else:
             imported_requests = self.state_mgr.import_cloud_request_logs(logs_items)
             subsystems["logs"]["status"] = "ok"
             subsystems["logs"]["message"] = f"{imported_requests} reqs in 5h ({page_count} pages traversed)"
-            subsystems["logs"]["last_sync"] = now_str
-        elif logs_err:
-            subsystems["logs"]["status"] = "error"
-            subsystems["logs"]["message"] = logs_err
-            errors.append(f"Request logs: {logs_err}")
-        else:
-            # 0 items found, but request succeeded
-            subsystems["logs"]["status"] = "ok"
-            subsystems["logs"]["message"] = "0 requests in 5h window"
             subsystems["logs"]["last_sync"] = now_str
 
         # 3. Fetch official Go subscription status

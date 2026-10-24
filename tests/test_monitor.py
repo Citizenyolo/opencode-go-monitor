@@ -289,5 +289,193 @@ class TestSyncSubsystemStatus(unittest.TestCase):
         self.assertIn("summary", snap["subsystems"])
 
 
+class TestSyncIntegration(unittest.TestCase):
+    def setUp(self):
+        self.orig_data_file = server.DATA_FILE
+        self.test_dir = tempfile.mkdtemp()
+        self.test_data = os.path.join(self.test_dir, "monitor_state.json")
+        server.DATA_FILE = self.test_data
+        self.state = server.StateManager()
+        self.engine = server.OpenCodeSyncEngine(self.state)
+        self.now = time.time()
+
+        # Mock credentials
+        self.orig_load_key = server.load_env_key
+        self.orig_load_oauth = server.load_opencode_oauth_token
+        server.load_env_key = lambda: "oc_sk_mock_valid_key"
+        server.load_opencode_oauth_token = lambda: "mock_oauth_token"
+
+    def tearDown(self):
+        server.load_env_key = self.orig_load_key
+        server.load_opencode_oauth_token = self.orig_load_oauth
+        server.DATA_FILE = self.orig_data_file
+        if os.path.exists(self.test_data):
+            os.remove(self.test_data)
+        if os.path.exists(self.test_dir):
+            os.rmdir(self.test_dir)
+
+    def test_sync_now_multiple_pages_150_plus(self):
+        # 100 items on page 1, 60 items on page 2 (total 160 requests within 5h window)
+        page1_items = [
+            {"id": f"p1_{i}", "model": "gemini-4-argon", "startedAt": int((self.now - 600 - i * 10) * 1000)}
+            for i in range(100)
+        ]
+        page2_items = [
+            {"id": f"p2_{i}", "model": "gemini-4-argon", "startedAt": int((self.now - 3600 - i * 10) * 1000)}
+            for i in range(59)
+        ]
+        # Add 1 item that is older than 5 hours to trigger window boundary
+        page2_items.append({"id": "old_boundary", "model": "gemini-4-argon", "startedAt": int((self.now - 6 * 3600) * 1000)})
+
+        def mock_api_get(endpoint, tokens, headers=None):
+            if "usage/models" in endpoint:
+                return {"items": [{"model": "gemini-4-argon", "totalCostMicroCents": 100000000}]}, None
+            elif "request-logs" in endpoint:
+                if "cursor=page2" in endpoint:
+                    return {"items": page2_items, "nextCursor": None}, None
+                else:
+                    return {"items": page1_items, "nextCursor": "page2"}, None
+            elif "go/status" in endpoint:
+                return {"access": {"meters": {"fiveHour": {"usedMicroCents": 1000, "limitMicroCents": 4800000000}}}}, None
+            elif "usage/summary" in endpoint:
+                return {"totalCostMicroCents": 50000000, "totalRequests": 159}, None
+            return None, "Not found"
+
+        self.engine._api_get = mock_api_get
+        success, msg = self.engine.sync_now()
+
+        self.assertTrue(success)
+        snap = self.engine.get_sync_state_snapshot()
+        self.assertEqual(snap["status"], "ok")
+        self.assertEqual(snap["subsystems"]["logs"]["status"], "ok")
+        self.assertIn("2 pages traversed", snap["subsystems"]["logs"]["message"])
+        self.assertEqual(self.state.models["gemini-4-argon"]["current_req_5h"], 159)
+
+    def test_sync_now_failure_on_page_2_retains_data(self):
+        # Pre-populate state with 15 requests
+        for _ in range(15):
+            self.state.record_request("kimi-k3-1-pro", count=1, est_dollars=0.01)
+        self.assertEqual(self.state.models["kimi-k3-1-pro"]["current_req_5h"], 15)
+
+        page1_items = [
+            {"id": f"p1_{i}", "model": "kimi-k3-1-pro", "startedAt": int((self.now - 300) * 1000)}
+            for i in range(50)
+        ]
+
+        def mock_api_get(endpoint, tokens, headers=None):
+            if "usage/models" in endpoint:
+                return {"items": []}, None
+            elif "request-logs" in endpoint:
+                if "cursor=page2" in endpoint:
+                    # Page 2 fails with HTTP 500!
+                    return None, "HTTP 500 Internal Server Error"
+                else:
+                    return {"items": page1_items, "nextCursor": "page2"}, None
+            elif "go/status" in endpoint:
+                return {"access": {"meters": {}}}, None
+            elif "usage/summary" in endpoint:
+                return {}, None
+            return None, "Not found"
+
+        self.engine._api_get = mock_api_get
+        success, msg = self.engine.sync_now()
+
+        snap = self.engine.get_sync_state_snapshot()
+        # Subsystem logs must be error, and overall status must be degraded
+        self.assertEqual(snap["subsystems"]["logs"]["status"], "error")
+        self.assertIn("retained previous data", snap["subsystems"]["logs"]["message"])
+        self.assertEqual(snap["status"], "degraded")
+
+        # Crucial check: previous 15 requests must NOT have been overwritten by partial page 1!
+        self.assertEqual(self.state.models["kimi-k3-1-pro"]["current_req_5h"], 15)
+
+    def test_sync_now_max_pages_limit_reached_retains_data(self):
+        # Pre-populate state with 8 requests
+        for _ in range(8):
+            self.state.record_request("mimo-v2-6-pro", count=1, est_dollars=0.01)
+
+        def mock_api_get(endpoint, tokens, headers=None):
+            if "usage/models" in endpoint:
+                return {"items": []}, None
+            elif "request-logs" in endpoint:
+                # Always returns recent items with a nextCursor, never reaching 5h boundary
+                items = [{"id": f"inf_{time.time_ns()}", "model": "mimo-v2-6-pro", "startedAt": int((self.now - 60) * 1000)}]
+                return {"items": items, "nextCursor": "keep_going"}, None
+            elif "go/status" in endpoint:
+                return {"access": {"meters": {}}}, None
+            elif "usage/summary" in endpoint:
+                return {}, None
+            return None, "Not found"
+
+        self.engine._api_get = mock_api_get
+        success, msg = self.engine.sync_now()
+
+        snap = self.engine.get_sync_state_snapshot()
+        self.assertEqual(snap["subsystems"]["logs"]["status"], "error")
+        self.assertIn("Max pagination limit", snap["subsystems"]["logs"]["message"])
+        self.assertEqual(snap["status"], "degraded")
+        # Retained previous 8 requests
+        self.assertEqual(self.state.models["mimo-v2-6-pro"]["current_req_5h"], 8)
+
+    def test_sync_now_successful_empty_response_clears_stale_counters(self):
+        # gemini-4-argon has 10 normal requests
+        for _ in range(10):
+            self.state.record_request("gemini-4-argon", count=1, est_dollars=0.01)
+        # kimi-k3-1-pro has a manual override of 25 requests
+        self.state.update_model("kimi-k3-1-pro", req_5h=25, spent_usd=5.0)
+
+        self.assertEqual(self.state.models["gemini-4-argon"]["current_req_5h"], 10)
+        self.assertEqual(self.state.models["kimi-k3-1-pro"]["current_req_5h"], 25)
+
+        def mock_api_get(endpoint, tokens, headers=None):
+            if "usage/models" in endpoint:
+                return {"items": []}, None
+            elif "request-logs" in endpoint:
+                # Cloud reports 0 requests in the window
+                return {"items": [], "nextCursor": None}, None
+            elif "go/status" in endpoint:
+                return {"access": {"meters": {}}}, None
+            elif "usage/summary" in endpoint:
+                return {}, None
+            return None, "Not found"
+
+        self.engine._api_get = mock_api_get
+        success, msg = self.engine.sync_now()
+
+        snap = self.engine.get_sync_state_snapshot()
+        self.assertEqual(snap["subsystems"]["logs"]["status"], "ok")
+        # gemini-4-argon should now be cleared to 0
+        self.assertEqual(self.state.models["gemini-4-argon"]["current_req_5h"], 0)
+        self.assertEqual(self.state.models["gemini-4-argon"]["timestamps"], [])
+        # kimi-k3-1-pro was manually overridden, so its 25 count must be preserved!
+        self.assertEqual(self.state.models["kimi-k3-1-pro"]["current_req_5h"], 25)
+        self.assertTrue(self.state.models["kimi-k3-1-pro"]["manual_override"])
+
+    def test_sync_now_partial_failure_of_subsystems(self):
+        def mock_api_get(endpoint, tokens, headers=None):
+            if "usage/models" in endpoint:
+                return {"items": [{"model": "gemini-4-argon", "totalCostMicroCents": 50000000}]}, None
+            elif "request-logs" in endpoint:
+                return {"items": [], "nextCursor": None}, None
+            elif "go/status" in endpoint:
+                # go/status fails
+                return None, "HTTP 401 Unauthorized"
+            elif "usage/summary" in endpoint:
+                return {"totalCostMicroCents": 10000000, "totalRequests": 5}, None
+            return None, "Not found"
+
+        self.engine._api_get = mock_api_get
+        success, msg = self.engine.sync_now()
+
+        snap = self.engine.get_sync_state_snapshot()
+        self.assertEqual(snap["subsystems"]["models"]["status"], "ok")
+        self.assertEqual(snap["subsystems"]["logs"]["status"], "ok")
+        self.assertEqual(snap["subsystems"]["go_status"]["status"], "error")
+        self.assertEqual(snap["subsystems"]["summary"]["status"], "ok")
+        # Overall status must be degraded
+        self.assertEqual(snap["status"], "degraded")
+        self.assertIn("go_status", snap["message"])
+
+
 if __name__ == "__main__":
     unittest.main()
