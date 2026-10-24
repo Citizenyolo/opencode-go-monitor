@@ -4,6 +4,8 @@ A lightweight, real-time HTTP telemetry and quota monitoring dashboard built spe
 
 Tracks 5-hour rolling request quotas, monthly dollar allowances, live spend meters, and automatic escalation pathways with zero external dependencies.
 
+![OpenCode Go Fleet Monitor Dashboard](assets/dashboard-preview.png)
+
 ---
 
 ## 🌐 Quick Start
