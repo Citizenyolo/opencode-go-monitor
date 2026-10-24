@@ -27,16 +27,16 @@ def main():
     alerts = data.get("alerts", [])
 
     # Menu bar top text
+    kimi = models.get("kimi-k3-1-pro", {})
     argon = models.get("gemini-4-argon", {})
     mimo = models.get("mimo-v2-6-pro", {})
-    sol = models.get("sol-6-1-high", {})
 
     status_icon = "🟢" if len(alerts) == 0 else "🔴"
+    kimi_pct = f"{kimi.get('pct_5h', 0):.0f}%" if kimi else "-"
     argon_pct = f"{argon.get('pct_5h', 0):.0f}%" if argon else "-"
     mimo_pct = f"{mimo.get('pct_5h', 0):.0f}%" if mimo else "-"
-    sol_pct = f"{sol.get('pct_5h', 0):.0f}%" if sol else "-"
 
-    print(f"{status_icon} v6: Sol {sol_pct} | Argon {argon_pct} | MiMo {mimo_pct}")
+    print(f"{status_icon} Go: Kimi {kimi_pct} | Argon {argon_pct} | MiMo {mimo_pct}")
     print("---")
 
     # Header & Web Dashboard Link
@@ -59,7 +59,7 @@ def main():
         pct_usd = m["pct_usd"]
         is_unlimited = m["is_unlimited_5h"]
 
-        dot = "🟢" if m["risk"] == "NORMAL" else ("🟡" if m["risk"] == "WARNING" else "🔴")
+        dot = "🟢" if m.get("risk") in ("OK", "NORMAL") else ("🟡" if m.get("risk") == "WARNING" else "🔴")
         
         if is_unlimited:
             val_str = "∞ Korlátlan"

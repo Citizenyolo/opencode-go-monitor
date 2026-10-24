@@ -275,33 +275,91 @@ def load_opencode_oauth_token():
     return ""
 
 def save_env_key(key):
-    """Saves OpenCode API key to local .env file with chmod 600."""
+    """Saves OpenCode API key to local .env file atomically, preserving all other variables."""
     key = key.strip()
     os.environ["OPENCODE_API_KEY"] = key
-    try:
-        with open(ENV_FILE, "w") as f:
-            f.write(f"OPENCODE_API_KEY={key}\n")
+    lines = []
+    found = False
+
+    if os.path.exists(ENV_FILE):
         try:
-            os.chmod(ENV_FILE, 0o600)
+            with open(ENV_FILE, "r") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped.startswith("OPENCODE_API_KEY=") or stripped.startswith("oc_sk_"):
+                        lines.append(f"OPENCODE_API_KEY={key}\n")
+                        found = True
+                    else:
+                        lines.append(line)
+        except Exception as e:
+            print(f"[Env] Error reading existing .env: {e}")
+
+    if not found:
+        lines.append(f"OPENCODE_API_KEY={key}\n")
+
+    tmp_path = f"{ENV_FILE}.{os.getpid()}.{time.time_ns()}.tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            f.writelines(lines)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp_path, 0o600)
         except Exception:
             pass
+        os.replace(tmp_path, ENV_FILE)
         return True
     except Exception as e:
         print(f"[Env] Error saving .env: {e}")
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
         return False
 
 def delete_env_key():
-    """Deletes API key from memory and local .env."""
+    """Deletes API key from memory and local .env, preserving all other configuration."""
     if "OPENCODE_API_KEY" in os.environ:
         del os.environ["OPENCODE_API_KEY"]
-    if os.path.exists(ENV_FILE):
+    if not os.path.exists(ENV_FILE):
+        return True
+
+    lines = []
+    has_other_content = False
+    try:
+        with open(ENV_FILE, "r") as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith("OPENCODE_API_KEY=") or stripped.startswith("oc_sk_"):
+                    continue
+                lines.append(line)
+                if stripped and not stripped.startswith("#"):
+                    has_other_content = True
+    except Exception as e:
+        print(f"[Env] Error reading .env for deletion: {e}")
+        return False
+
+    tmp_path = f"{ENV_FILE}.{os.getpid()}.{time.time_ns()}.tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            f.writelines(lines)
+            f.flush()
+            os.fsync(f.fileno())
         try:
-            os.remove(ENV_FILE)
-            return True
-        except Exception as e:
-            print(f"[Env] Error deleting .env: {e}")
-            return False
-    return True
+            os.chmod(tmp_path, 0o600)
+        except Exception:
+            pass
+        os.replace(tmp_path, ENV_FILE)
+        return True
+    except Exception as e:
+        print(f"[Env] Error updating .env on delete: {e}")
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        return False
 
 def mask_key(key):
     if not key:
@@ -310,14 +368,63 @@ def mask_key(key):
         return "..."
     return key[:6] + "..." + key[-4:]
 
-# --- Canonical Model Mappings for Ingestion ---
+# --- Canonical Model Resolution (Strict matching, no loose substring false positives) ---
+CANONICAL_MODEL_ALIASES = {
+    # Kimi
+    "kimi-k3-1-pro": "kimi-k3-1-pro",
+    "kimi-k3-1": "kimi-k3-1-pro",
+    "kimi-k3": "kimi-k3-1-pro",
+    "kimi-k3-pro": "kimi-k3-1-pro",
+    
+    # Gemini 4 Argon
+    "gemini-4-argon": "gemini-4-argon",
+    "gemini-4-argon-contributor": "gemini-4-argon",
+    
+    # GLM 5.3
+    "glm-5-3": "glm-5-3",
+    "glm-5-3-flash": "glm-5-3",
+    
+    # MiMo V2.6 Pro
+    "mimo-v2-6-pro": "mimo-v2-6-pro",
+    "mimo-v2-6": "mimo-v2-6-pro",
+    
+    # DeepSeek V4 Pro
+    "deepseek-v4-pro": "deepseek-v4-pro",
+    
+    # DeepSeek V4.1 Flash
+    "deepseek-v4-1-flash": "deepseek-v4-1-flash",
+    "deepseek-v4-flash": "deepseek-v4-1-flash",
+    "deepseek-flash": "deepseek-v4-1-flash",
+    
+    # Claude Haiku 5.5
+    "claude-haiku-5-5": "claude-haiku-5-5",
+    
+    # MiMo V2.6 Flash
+    "mimo-v2-6-flash": "mimo-v2-6-flash",
+    
+    # BEAM Free
+    "beam-free": "beam-free",
+    "beam": "beam-free",
+}
+
+def resolve_model_id(raw_name):
+    """Resolves arbitrary API model strings to canonical fleet model IDs strictly."""
+    if not raw_name or not isinstance(raw_name, str):
+        return None
+    slug = raw_name.lower().strip()
+    # Strip provider path e.g. "moonshotai/kimi-k3.1" -> "kimi-k3.1"
+    if "/" in slug:
+        slug = slug.split("/")[-1]
+    # Normalize separators
+    slug = slug.replace(".", "-").replace("_", "-")
+    return CANONICAL_MODEL_ALIASES.get(slug)
+
 MODEL_MAPPINGS = [
     ("gemini-4-argon-contributor", "gemini-4-argon"),
     ("gemini-4-argon", "gemini-4-argon"),
     ("kimi-k3.1-pro", "kimi-k3-1-pro"),
     ("kimi-k3.1", "kimi-k3-1-pro"),
     ("kimi-k3", "kimi-k3-1-pro"),
-    ("kimi", "kimi-k3-1-pro"),
     ("glm-5.3-flash", "glm-5-3"),
     ("glm-5.3", "glm-5-3"),
     ("mimo-v2.6-flash", "mimo-v2-6-flash"),
@@ -335,6 +442,7 @@ MODEL_MAPPINGS = [
 
 class StateManager:
     def __init__(self):
+        self.lock = threading.RLock()
         self.models = copy.deepcopy(DEFAULT_MODELS)
         self.active_tier = "go-plus"  # "go" or "go-plus"
         self.tier_mode = "auto"       # "auto", "go", "go-plus"
@@ -355,294 +463,401 @@ class StateManager:
         self.load()
 
     def set_tier_mode(self, mode):
-        self.tier_mode = mode
-        if mode in ("go", "go-plus"):
-            self.apply_tier(mode)
-        elif mode == "auto":
-            limit_usd = self.go_status.get("rolling", {}).get("limit_usd", 12.0)
-            detected = "go-plus" if limit_usd >= 40.0 else "go"
-            self.apply_tier(detected)
+        with self.lock:
+            self.tier_mode = mode
+            if mode in ("go", "go-plus"):
+                self.apply_tier(mode)
+            elif mode == "auto":
+                limit_usd = self.go_status.get("rolling", {}).get("limit_usd", 12.0)
+                detected = "go-plus" if limit_usd >= 40.0 else "go"
+                self.apply_tier(detected)
 
     def apply_tier(self, tier):
-        if tier not in ("go", "go-plus"):
-            tier = "go-plus"
-        self.active_tier = tier
-        updated = 0
-        tier_label = "Go Plus" if tier == "go-plus" else "Go"
+        with self.lock:
+            if tier not in ("go", "go-plus"):
+                tier = "go-plus"
+            self.active_tier = tier
+            updated = 0
+            tier_label = "Go Plus" if tier == "go-plus" else "Go"
 
-        for m_id, m in self.models.items():
-            base_prov = m.get("raw_provider") or m["provider"].split("(")[0].strip()
-            m["raw_provider"] = base_prov
-            m["provider"] = f"{base_prov} (OpenCode {tier_label})"
+            for m_id, m in self.models.items():
+                base_prov = m.get("raw_provider") or m["provider"].split("(")[0].strip()
+                m["raw_provider"] = base_prov
+                m["provider"] = f"{base_prov} (OpenCode {tier_label})"
 
-            cat_info = None
-            if self.catalog_cache and m_id in self.catalog_cache:
-                cat_info = self.catalog_cache[m_id].get(tier)
+                cat_info = None
+                if self.catalog_cache and m_id in self.catalog_cache:
+                    cat_info = self.catalog_cache[m_id].get(tier)
 
-            if cat_info:
-                new_req = cat_info.get("requests_5h")
-                new_usd = cat_info.get("limit_monthly_usd")
-                is_ltd = cat_info.get("is_limited_time", False)
-                bonus = cat_info.get("bonus", 1)
-            elif tier in TIER_MODELS_CONFIG and m_id in TIER_MODELS_CONFIG[tier]:
-                cfg = TIER_MODELS_CONFIG[tier][m_id]
-                new_req = cfg["limit_5h"]
-                new_usd = cfg["limit_usd"]
-                is_ltd = cfg["is_ltd"]
-                bonus = cfg["bonus"]
-            else:
-                continue
+                if cat_info:
+                    new_req = cat_info.get("requests_5h")
+                    new_usd = cat_info.get("limit_monthly_usd")
+                    is_ltd = cat_info.get("is_limited_time", False)
+                    bonus = cat_info.get("bonus", 1)
+                elif tier in TIER_MODELS_CONFIG and m_id in TIER_MODELS_CONFIG[tier]:
+                    cfg = TIER_MODELS_CONFIG[tier][m_id]
+                    new_req = cfg["limit_5h"]
+                    new_usd = cfg["limit_usd"]
+                    is_ltd = cfg["is_ltd"]
+                    bonus = cfg["bonus"]
+                else:
+                    continue
 
-            if new_req == '∞' or new_req == 0:
-                m["is_unlimited_5h"] = True
-            else:
-                m["is_unlimited_5h"] = False
-                m["limit_5h_req"] = int(new_req)
+                if new_req == '∞' or new_req == 0:
+                    m["is_unlimited_5h"] = True
+                else:
+                    m["is_unlimited_5h"] = False
+                    m["limit_5h_req"] = int(new_req)
 
-            if new_usd == '∞' or new_usd == 0.0:
-                m["is_unlimited_usd"] = True
-            else:
-                m["is_unlimited_usd"] = False
-                m["limit_monthly_usd"] = float(new_usd)
+                if new_usd == '∞' or new_usd == 0.0:
+                    m["is_unlimited_usd"] = True
+                else:
+                    m["is_unlimited_usd"] = False
+                    m["limit_monthly_usd"] = float(new_usd)
 
-            m["is_limited_time"] = is_ltd
-            m["promo_bonus"] = bonus
-            updated += 1
+                m["is_limited_time"] = is_ltd
+                m["promo_bonus"] = bonus
+                updated += 1
 
-        self.save()
-        return updated
+            self.save()
+            return updated
 
     def update_go_status(self, go_data):
         if not go_data:
             return
-        access = go_data.get("access", {})
-        meters = access.get("meters", {})
-        
-        product = (go_data.get("product") or "").lower()
-        five_meter = meters.get("fiveHour") or {}
-        limit_micro_5h = int(five_meter.get("limitMicroCents") or 0)
-        
-        detected_tier = "go-plus" if (product == "go-plus" or limit_micro_5h >= 4000000000) else "go"
-        if self.tier_mode == "auto":
-            self.apply_tier(detected_tier)
+        with self.lock:
+            access = go_data.get("access", {})
+            meters = access.get("meters", {})
+            
+            product = (go_data.get("product") or "").lower()
+            five_meter = meters.get("fiveHour") or {}
+            limit_micro_5h = int(five_meter.get("limitMicroCents") or 0)
+            
+            detected_tier = "go-plus" if (product == "go-plus" or limit_micro_5h >= 4000000000) else "go"
+            if self.tier_mode == "auto":
+                self.apply_tier(detected_tier)
 
-        def_rolling = 48.0 if self.active_tier == "go-plus" else 12.0
-        def_weekly = 120.0 if self.active_tier == "go-plus" else 30.0
-        def_monthly = 240.0 if self.active_tier == "go-plus" else 60.0
+            def_rolling = 48.0 if self.active_tier == "go-plus" else 12.0
+            def_weekly = 120.0 if self.active_tier == "go-plus" else 30.0
+            def_monthly = 240.0 if self.active_tier == "go-plus" else 60.0
 
-        def parse_meter(m, def_limit=0.0):
-            if not m:
-                return {"pct": 0.0, "resets_at": "", "used_usd": 0.0, "limit_usd": round(def_limit, 1)}
-            used_micro = int(m.get("usedMicroCents") or 0)
-            limit_micro = int(m.get("limitMicroCents") or 1)
-            pct = round((used_micro / limit_micro) * 100, 1) if limit_micro > 0 else 0.0
-            return {
-                "pct": pct,
-                "used_usd": round(used_micro / 100_000_000.0, 1),
-                "limit_usd": int(limit_micro / 100_000_000.0) if (limit_micro / 100_000_000.0).is_integer() else round(limit_micro / 100_000_000.0, 1),
-                "resets_at": m.get("resetsAt") or ""
+            def parse_meter(m, def_limit=0.0):
+                if not m:
+                    return {"pct": 0.0, "resets_at": "", "used_usd": 0.0, "limit_usd": round(def_limit, 1)}
+                used_micro = int(m.get("usedMicroCents") or 0)
+                limit_micro = int(m.get("limitMicroCents") or 1)
+                pct = round((used_micro / limit_micro) * 100, 1) if limit_micro > 0 else 0.0
+                return {
+                    "pct": pct,
+                    "used_usd": round(used_micro / 100_000_000.0, 1),
+                    "limit_usd": int(limit_micro / 100_000_000.0) if (limit_micro / 100_000_000.0).is_integer() else round(limit_micro / 100_000_000.0, 1),
+                    "resets_at": m.get("resetsAt") or ""
+                }
+
+            ends_at = access.get("endsAt") or ""
+            renews_label = "Renews Nov 24"
+            if ends_at:
+                try:
+                    dt = datetime.fromisoformat(ends_at.replace("Z", "+00:00"))
+                    renews_label = f"Renews {dt.strftime('%b %d')}"
+                except Exception:
+                    pass
+
+            self.go_status = {
+                "rolling": parse_meter(meters.get("fiveHour"), def_rolling),
+                "weekly": parse_meter(meters.get("week"), def_weekly),
+                "monthly": parse_meter(meters.get("month"), def_monthly),
+                "renews_at": ends_at,
+                "renews_label": renews_label
             }
 
-        ends_at = access.get("endsAt") or ""
-        renews_label = "Renews Nov 24"
-        if ends_at:
-            try:
-                dt = datetime.fromisoformat(ends_at.replace("Z", "+00:00"))
-                renews_label = f"Renews {dt.strftime('%b %d')}"
-            except Exception:
-                pass
-
-        self.go_status = {
-            "rolling": parse_meter(meters.get("fiveHour"), def_rolling),
-            "weekly": parse_meter(meters.get("week"), def_weekly),
-            "monthly": parse_meter(meters.get("month"), def_monthly),
-            "renews_at": ends_at,
-            "renews_label": renews_label
-        }
-
     def update_cost_summary(self, today_data, mtd_data):
-        if today_data:
-            today_micro = int(today_data.get("totalCostMicroCents") or 0)
-            self.cost_summary["today_usd"] = round(today_micro / 100_000_000.0, 1)
-            self.cost_summary["today_requests"] = int(today_data.get("totalRequests") or 0)
-        if mtd_data:
-            mtd_micro = int(mtd_data.get("totalCostMicroCents") or 0)
-            self.cost_summary["mtd_usd"] = round(mtd_micro / 100_000_000.0, 1)
-            self.cost_summary["mtd_requests"] = int(mtd_data.get("totalRequests") or 0)
+        with self.lock:
+            if today_data:
+                today_micro = int(today_data.get("totalCostMicroCents") or 0)
+                self.cost_summary["today_usd"] = round(today_micro / 100_000_000.0, 1)
+                self.cost_summary["today_requests"] = int(today_data.get("totalRequests") or 0)
+            if mtd_data:
+                mtd_micro = int(mtd_data.get("totalCostMicroCents") or 0)
+                self.cost_summary["mtd_usd"] = round(mtd_micro / 100_000_000.0, 1)
+                self.cost_summary["mtd_requests"] = int(mtd_data.get("totalRequests") or 0)
 
     def load(self):
-        if os.path.exists(DATA_FILE):
-            try:
-                with open(DATA_FILE, "r") as f:
-                    saved = json.load(f)
-                    for k, v in saved.items():
-                        if k in self.models:
-                            for attr in [
-                                "timestamps", "current_req_5h", "current_spent_usd", "manual_override",
-                                "limit_5h_req", "limit_monthly_usd", "is_unlimited_5h", "is_unlimited_usd",
-                                "is_limited_time", "promo_bonus", "provider"
-                            ]:
-                                if attr in v:
-                                    self.models[k][attr] = v[attr]
-            except Exception as e:
-                print(f"[State] Load error: {e}")
+        with self.lock:
+            if os.path.exists(DATA_FILE):
+                try:
+                    with open(DATA_FILE, "r") as f:
+                        saved = json.load(f)
+                        for k, v in saved.items():
+                            if k in self.models:
+                                for attr in [
+                                    "timestamps", "current_req_5h", "current_spent_usd", "manual_override",
+                                    "limit_5h_req", "limit_monthly_usd", "is_unlimited_5h", "is_unlimited_usd",
+                                    "is_limited_time", "promo_bonus", "provider"
+                                ]:
+                                    if attr in v:
+                                        self.models[k][attr] = v[attr]
+                except Exception as e:
+                    print(f"[State] Load error: {e}")
 
     def update_catalog_limits(self, catalog_data):
         if not catalog_data:
             return 0
-        self.catalog_cache = catalog_data
-        updated = self.apply_tier(self.active_tier)
-        if updated > 0:
-            print(f"[Catalog] Updated live limits for {updated} models (tier: {self.active_tier}).")
-        return updated
+        with self.lock:
+            self.catalog_cache = catalog_data
+            updated = self.apply_tier(self.active_tier)
+            if updated > 0:
+                print(f"[Catalog] Updated live limits for {updated} models (tier: {self.active_tier}).")
+            return updated
 
     def save(self):
-        try:
-            with open(DATA_FILE, "w") as f:
-                json.dump(self.models, f, indent=2)
-        except Exception as e:
-            print(f"[State] Save error: {e}")
+        with self.lock:
+            tmp_path = f"{DATA_FILE}.{os.getpid()}.{time.time_ns()}.tmp"
+            try:
+                with open(tmp_path, "w") as f:
+                    json.dump(self.models, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, DATA_FILE)
+            except Exception as e:
+                print(f"[State] Save error: {e}")
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
 
     def clean_sliding_windows(self):
-        now = time.time()
-        five_hours_ago = now - 5 * 3600
-        for m in self.models.values():
-            if "timestamps" in m and m["timestamps"]:
-                m["timestamps"] = [ts for ts in m["timestamps"] if ts > five_hours_ago]
-                if not m.get("manual_override", False):
-                    m["current_req_5h"] = len(m["timestamps"])
+        with self.lock:
+            now = time.time()
+            five_hours_ago = now - 5 * 3600
+            for m in self.models.values():
+                if "timestamps" in m and m["timestamps"]:
+                    m["timestamps"] = [ts for ts in m["timestamps"] if ts > five_hours_ago]
+                    if not m.get("manual_override", False):
+                        m["current_req_5h"] = len(m["timestamps"])
 
     def record_request(self, model_id, count=1, est_dollars=0.0):
-        if model_id in self.models:
-            m = self.models[model_id]
-            now = time.time()
-            if "timestamps" not in m:
-                m["timestamps"] = []
-            for _ in range(count):
-                m["timestamps"].append(now)
-            m["current_req_5h"] = len(m["timestamps"])
-            m["current_spent_usd"] = round(m.get("current_spent_usd", 0.0) + est_dollars, 4)
-            self.save()
-            return True
-        return False
+        with self.lock:
+            if model_id in self.models:
+                m = self.models[model_id]
+                now = time.time()
+                if "timestamps" not in m:
+                    m["timestamps"] = []
+                for _ in range(count):
+                    m["timestamps"].append(now)
+                m["current_req_5h"] = len(m["timestamps"])
+                m["current_spent_usd"] = round(m.get("current_spent_usd", 0.0) + est_dollars, 4)
+                self.save()
+                return True
+            return False
 
     def update_model(self, model_id, req_5h, spent_usd):
-        if model_id in self.models:
-            m = self.models[model_id]
-            m["manual_override"] = True
-            m["current_req_5h"] = int(req_5h)
-            m["current_spent_usd"] = float(spent_usd)
-            self.save()
-            return True
-        return False
+        with self.lock:
+            if model_id in self.models:
+                m = self.models[model_id]
+                m["manual_override"] = True
+                m["current_req_5h"] = int(req_5h)
+                m["current_spent_usd"] = float(spent_usd)
+                self.save()
+                return True
+            return False
+
+    def clear_override(self, model_id=None, clear_all=False):
+        """Clears manual override and resumes automatic sliding window updates."""
+        with self.lock:
+            cleared = 0
+            for k, m in self.models.items():
+                if clear_all or (model_id and k == model_id):
+                    m["manual_override"] = False
+                    m["current_req_5h"] = len(m.get("timestamps", []))
+                    cleared += 1
+            if cleared:
+                self.save()
+            return cleared
 
     def import_cloud_models(self, models_data):
-        items = models_data.get("items", []) if isinstance(models_data, dict) else models_data
-        if not items:
-            return 0
-        
-        # Reset spent for opencode models before importing fresh cloud totals
-        for k, m in self.models.items():
-            if "OpenCode" in m.get("provider", ""):
-                m["current_spent_usd"] = 0.0
-
-        matched = 0
-        for it in items:
-            m_raw = (it.get("model") or "").lower()
-            target_id = None
-            for pattern, m_id in MODEL_MAPPINGS:
-                if pattern in m_raw:
-                    target_id = m_id
-                    break
+        with self.lock:
+            items = models_data.get("items", []) if isinstance(models_data, dict) else models_data
+            if not items:
+                return 0
             
-            if target_id and target_id in self.models:
-                cost_micro = int(it.get("totalCostMicroCents") or 0)
-                cost_usd = round(cost_micro / 100_000_000.0, 4)
-                self.models[target_id]["current_spent_usd"] = round(self.models[target_id]["current_spent_usd"] + cost_usd, 4)
-                matched += 1
+            # Reset spent for opencode models before importing fresh cloud totals
+            for k, m in self.models.items():
+                if "OpenCode" in m.get("provider", ""):
+                    m["current_spent_usd"] = 0.0
 
-        self.save()
-        return matched
+            matched = 0
+            for it in items:
+                m_raw = (it.get("model") or "").strip()
+                target_id = resolve_model_id(m_raw) or (m_raw if m_raw in self.models else None)
+                
+                if target_id and target_id in self.models:
+                    cost_micro = int(it.get("totalCostMicroCents") or 0)
+                    cost_usd = round(cost_micro / 100_000_000.0, 4)
+                    self.models[target_id]["current_spent_usd"] = round(self.models[target_id]["current_spent_usd"] + cost_usd, 4)
+                    matched += 1
+
+            self.save()
+            return matched
 
     def import_cloud_request_logs(self, logs_data):
-        items = logs_data.get("items", []) if isinstance(logs_data, dict) else logs_data
-        if not items:
-            return 0
-        
-        now = time.time()
-        five_hours_ago = now - 5 * 3600
-
-        for k in self.models:
-            self.models[k]["timestamps"] = []
-
-        matched = 0
-        for it in items:
-            m_raw = (it.get("model") or it.get("requestedModel") or "").lower()
-            target_id = None
-            for pattern, m_id in MODEL_MAPPINGS:
-                if pattern in m_raw:
-                    target_id = m_id
-                    break
+        with self.lock:
+            items = logs_data.get("items", []) if isinstance(logs_data, dict) else logs_data
+            if not items:
+                return 0
             
-            if target_id and target_id in self.models:
-                started_at = (it.get("startedAt") or 0) / 1000.0
-                if started_at > five_hours_ago:
-                    self.models[target_id]["timestamps"].append(started_at)
-                matched += 1
+            now = time.time()
+            five_hours_ago = now - 5 * 3600
 
-        for k in self.models:
-            self.models[k]["current_req_5h"] = len(self.models[k]["timestamps"])
+            # Group incoming timestamps by target model
+            model_timestamps = {k: [] for k in self.models}
+            matched = 0
 
-        self.save()
-        return matched
+            for it in items:
+                m_raw = (it.get("model") or it.get("requestedModel") or "").strip()
+                target_id = resolve_model_id(m_raw) or (m_raw if m_raw in self.models else None)
+                
+                if target_id and target_id in self.models:
+                    started_at = (it.get("startedAt") or 0) / 1000.0
+                    if started_at > five_hours_ago:
+                        model_timestamps[target_id].append(started_at)
+                    matched += 1
+
+            for k in self.models:
+                self.models[k]["timestamps"] = model_timestamps[k]
+                if not self.models[k].get("manual_override", False):
+                    self.models[k]["current_req_5h"] = len(model_timestamps[k])
+
+            self.save()
+            return matched
 
     def import_logs_data(self, log_dict):
-        items = log_dict.get("items", [])
-        if not items and isinstance(log_dict, list):
-            items = log_dict
-        if not items:
-            return 0
-        now = time.time()
-        five_hours_ago = now - 5 * 3600
-        
-        # Reset current counters before import
-        for k in self.models:
-            self.models[k]["timestamps"] = []
-            self.models[k]["current_req_5h"] = 0
-            self.models[k]["current_spent_usd"] = 0.0
-            self.models[k]["manual_override"] = False
-
-        imported_count = 0
-        for it in items:
-            m_raw = (it.get("model") or it.get("requestedModel") or "").lower()
-            target_id = None
-            for pattern, m_id in MODEL_MAPPINGS:
-                if pattern in m_raw:
-                    target_id = m_id
-                    break
+        with self.lock:
+            items = log_dict.get("items", [])
+            if not items and isinstance(log_dict, list):
+                items = log_dict
+            if not items:
+                return 0
+            now = time.time()
+            five_hours_ago = now - 5 * 3600
             
-            if target_id and target_id in self.models:
-                m = self.models[target_id]
-                started_at = (it.get("startedAt") or 0) / 1000.0
-                cost = float(it.get("cost") or 0.0)
-                m["current_spent_usd"] = round(m["current_spent_usd"] + cost, 4)
-                
-                # If started within 5 hours, count into rolling window
-                if started_at > five_hours_ago:
-                    m["timestamps"].append(started_at)
-                    m["current_req_5h"] = len(m["timestamps"])
-                imported_count += 1
+            # Reset current counters before import
+            for k in self.models:
+                self.models[k]["timestamps"] = []
+                self.models[k]["current_req_5h"] = 0
+                self.models[k]["current_spent_usd"] = 0.0
+                self.models[k]["manual_override"] = False
 
-        self.save()
-        return imported_count
+            imported_count = 0
+            for it in items:
+                m_raw = (it.get("model") or it.get("requestedModel") or "").strip()
+                target_id = resolve_model_id(m_raw) or (m_raw if m_raw in self.models else None)
+                
+                if target_id and target_id in self.models:
+                    m = self.models[target_id]
+                    started_at = (it.get("startedAt") or 0) / 1000.0
+                    cost = float(it.get("cost") or 0.0)
+                    m["current_spent_usd"] = round(m["current_spent_usd"] + cost, 4)
+                    
+                    if started_at > five_hours_ago:
+                        m["timestamps"].append(started_at)
+                        m["current_req_5h"] = len(m["timestamps"])
+                    imported_count += 1
+
+            self.save()
+            return imported_count
 
     def reset_all(self):
-        for k in self.models:
-            self.models[k]["timestamps"] = []
-            self.models[k]["current_req_5h"] = 0
-            self.models[k]["current_spent_usd"] = 0.0
-            self.models[k]["manual_override"] = False
-        self.save()
+        with self.lock:
+            for k in self.models:
+                self.models[k]["timestamps"] = []
+                self.models[k]["current_req_5h"] = 0
+                self.models[k]["current_spent_usd"] = 0.0
+                self.models[k]["manual_override"] = False
+            self.save()
+
+    def get_status_snapshot(self):
+        """Returns a thread-safe, consistent snapshot of monitor state for UI and API consumers."""
+        with self.lock:
+            self.clean_sliding_windows()
+            now = time.time()
+            models_data = []
+            alerts = []
+            
+            for m in self.models.values():
+                if m["is_unlimited_5h"]:
+                    pct_5h = 0.0
+                    status_5h = "UNLIMITED"
+                    reset_mins = 0
+                else:
+                    pct_5h = round((m["current_req_5h"] / m["limit_5h_req"]) * 100, 1)
+                    if m.get("timestamps"):
+                        earliest = min(m["timestamps"])
+                        reset_secs = max(0, (earliest + 5 * 3600) - now)
+                        reset_mins = int(reset_secs // 60)
+                    else:
+                        reset_mins = 0
+                
+                if m["is_unlimited_usd"]:
+                    pct_usd = 0.0
+                else:
+                    pct_usd = round((m["current_spent_usd"] / m["limit_monthly_usd"]) * 100, 1)
+
+                max_pct = max(pct_5h, pct_usd)
+                if max_pct >= 85:
+                    risk = "CRITICAL"
+                    if not m["is_unlimited_5h"] and pct_5h >= 85:
+                        alerts.append({
+                            "model": m["name"],
+                            "type": "5H_CAP",
+                            "msg": f"5H keret elérve ({pct_5h}%). Átirányítás: {m['escalation_target']}"
+                        })
+                    if not m["is_unlimited_usd"] and pct_usd >= 85:
+                        alerts.append({
+                            "model": m["name"],
+                            "type": "USD_CAP",
+                            "msg": f"Havi költési keret elérve ({pct_usd}%). Átirányítás: {m['escalation_target']}"
+                        })
+                elif max_pct >= 60:
+                    risk = "WARNING"
+                else:
+                    risk = "OK"
+
+                models_data.append({
+                    "id": m["id"],
+                    "name": m["name"],
+                    "role": m["role"],
+                    "category": m["category"],
+                    "categories": m.get("categories", [m["category"]]),
+                    "provider": m["provider"],
+                    "limit_5h_req": m["limit_5h_req"],
+                    "is_unlimited_5h": m["is_unlimited_5h"],
+                    "limit_monthly_usd": int(m["limit_monthly_usd"]) if float(m["limit_monthly_usd"]).is_integer() else round(m["limit_monthly_usd"], 1),
+                    "is_unlimited_usd": m["is_unlimited_usd"],
+                    "current_req_5h": m["current_req_5h"],
+                    "current_spent_usd": round(m["current_spent_usd"], 1),
+                    "pct_5h": round(pct_5h, 1),
+                    "pct_usd": round(pct_usd, 1),
+                    "reset_mins": reset_mins,
+                    "risk": risk,
+                    "manual_override": m.get("manual_override", False),
+                    "escalation_target": m["escalation_target"],
+                    "unit_desc": m["unit_desc"],
+                    "is_limited_time": m.get("is_limited_time", False),
+                    "promo_bonus": m.get("promo_bonus", 1)
+                })
+
+            return {
+                "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "total_models": len(models_data),
+                "active_tier": self.active_tier,
+                "tier_mode": self.tier_mode,
+                "alerts": alerts,
+                "models": models_data,
+                "go_status": copy.deepcopy(self.go_status),
+                "cost_summary": copy.deepcopy(self.cost_summary)
+            }
 
 state = StateManager()
 
@@ -657,10 +872,20 @@ class OpenCodeSyncEngine:
             "last_sync_timestamp": 0,
             "message": "Waiting for sync",
             "items_imported": 0,
-            "error_code": None
+            "error_code": None,
+            "subsystems": {
+                "models": {"status": "idle", "message": "", "last_sync": None},
+                "logs": {"status": "idle", "message": "", "last_sync": None},
+                "go_status": {"status": "idle", "message": "", "last_sync": None},
+                "summary": {"status": "idle", "message": "", "last_sync": None},
+            }
         }
         self.lock = threading.Lock()
         self.last_catalog_check = 0
+
+    def get_sync_state_snapshot(self):
+        with self.lock:
+            return copy.deepcopy(self.sync_state)
 
     def fetch_opencode_go_catalog(self):
         """
@@ -750,8 +975,10 @@ class OpenCodeSyncEngine:
         return result
 
     def sync_now(self, force_catalog=False):
-        # 0. Check live Go catalog limits & promotions from https://opencode.ai/go
         now_ts = time.time()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # 0. Check live Go catalog limits & promotions from https://opencode.ai/go
         if (now_ts - self.last_catalog_check > 300) or force_catalog or self.last_catalog_check == 0:
             try:
                 cat_limits = self.fetch_opencode_go_catalog()
@@ -801,57 +1028,139 @@ class OpenCodeSyncEngine:
                     return None, str(e)
             return None, "Authorization required"
 
+        subsystems = {
+            "models": {"status": "pending", "message": "", "last_sync": None},
+            "logs": {"status": "pending", "message": "", "last_sync": None},
+            "go_status": {"status": "pending", "message": "", "last_sync": None},
+            "summary": {"status": "pending", "message": "", "last_sync": None},
+        }
+        errors = []
         imported_models = 0
         imported_requests = 0
-        errors = []
 
         # 1. Fetch cloud aggregated model usage (MTD spent)
         data_models, err = api_get("https://opencode.ai/console/api/usage/models?range=all", [key, oauth_token])
         if data_models:
             imported_models = self.state_mgr.import_cloud_models(data_models)
-        elif err:
-            errors.append(f"Model aggregation: {err}")
+            subsystems["models"]["status"] = "ok"
+            subsystems["models"]["message"] = f"{imported_models} models mapped"
+            subsystems["models"]["last_sync"] = now_str
+        else:
+            subsystems["models"]["status"] = "error"
+            subsystems["models"]["message"] = err or "No model data"
+            if err:
+                errors.append(f"Model aggregation: {err}")
 
-        # 2. Fetch cloud live request logs (5h rolling window - requires session token)
-        data_logs, err = api_get("https://opencode.ai/console/api/request-logs?category=inference&limit=100", [oauth_token, key])
-        if data_logs:
-            imported_requests = self.state_mgr.import_cloud_request_logs(data_logs)
-        elif err:
-            errors.append(f"Request logs: {err}")
+        # 2. Fetch cloud live request logs with verified cursor pagination (P0.1)
+        logs_items = []
+        logs_err = None
+        cursor = None
+        max_pages = 25
+        page_count = 0
+        five_hours_ago = now_ts - 5 * 3600
 
-        # 3. Fetch official Go subscription status (Rolling 5h, Weekly, Monthly meters & resets)
+        while page_count < max_pages:
+            page_count += 1
+            url = "https://opencode.ai/console/api/request-logs?category=inference&limit=100"
+            if cursor:
+                url += f"&cursor={urllib.parse.quote(cursor)}"
+
+            data_logs, err = api_get(url, [oauth_token, key])
+            if err:
+                logs_err = err
+                break
+            if not data_logs:
+                break
+
+            items = data_logs.get("items", []) if isinstance(data_logs, dict) else (data_logs if isinstance(data_logs, list) else [])
+            if not items:
+                break
+
+            logs_items.extend(items)
+
+            # Check oldest item timestamp on page
+            oldest_on_page = min((it.get("startedAt") or 0) / 1000.0 for it in items)
+            if oldest_on_page < five_hours_ago:
+                # Reached past the 5h sliding window
+                break
+
+            next_cursor = data_logs.get("nextCursor") if isinstance(data_logs, dict) else None
+            if not next_cursor:
+                break
+            cursor = next_cursor
+
+        if logs_items:
+            imported_requests = self.state_mgr.import_cloud_request_logs(logs_items)
+            subsystems["logs"]["status"] = "ok"
+            subsystems["logs"]["message"] = f"{imported_requests} reqs in 5h ({page_count} pages traversed)"
+            subsystems["logs"]["last_sync"] = now_str
+        elif logs_err:
+            subsystems["logs"]["status"] = "error"
+            subsystems["logs"]["message"] = logs_err
+            errors.append(f"Request logs: {logs_err}")
+        else:
+            # 0 items found, but request succeeded
+            subsystems["logs"]["status"] = "ok"
+            subsystems["logs"]["message"] = "0 requests in 5h window"
+            subsystems["logs"]["last_sync"] = now_str
+
+        # 3. Fetch official Go subscription status
         data_go, err = api_get("https://opencode.ai/console/api/go/status", [oauth_token, key])
         if data_go:
             self.state_mgr.update_go_status(data_go)
-        elif err:
-            errors.append(f"Go status: {err}")
+            subsystems["go_status"]["status"] = "ok"
+            subsystems["go_status"]["message"] = "Subscription active"
+            subsystems["go_status"]["last_sync"] = now_str
+        else:
+            subsystems["go_status"]["status"] = "error"
+            subsystems["go_status"]["message"] = err or "Failed to fetch Go status"
+            if err:
+                errors.append(f"Go status: {err}")
 
-        # 4. Fetch Today (24h) and MTD (30d) usage summaries
-        today_data, _ = api_get("https://opencode.ai/console/api/usage/summary?range=24h", [key, oauth_token])
-        mtd_data, _ = api_get("https://opencode.ai/console/api/usage/summary?range=30d", [key, oauth_token])
+        # 4. Fetch 24h & 30d usage summaries
+        today_data, err_today = api_get("https://opencode.ai/console/api/usage/summary?range=24h", [key, oauth_token])
+        mtd_data, err_mtd = api_get("https://opencode.ai/console/api/usage/summary?range=30d", [key, oauth_token])
         if today_data or mtd_data:
             self.state_mgr.update_cost_summary(today_data, mtd_data)
+            subsystems["summary"]["status"] = "ok"
+            subsystems["summary"]["message"] = "Spend summary loaded"
+            subsystems["summary"]["last_sync"] = now_str
+        else:
+            subsystems["summary"]["status"] = "error"
+            subsystems["summary"]["message"] = err_mtd or err_today or "Failed to fetch summary"
+            if err_mtd:
+                errors.append(f"Cost summary: {err_mtd}")
 
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if imported_models > 0 or imported_requests > 0 or data_go:
-            tier_display = "Go Plus" if self.state_mgr.active_tier == "go-plus" else "Go"
-            msg = f"Live connection active [{tier_display}] ({imported_models} models MTD, {imported_requests} reqs in 5h)"
-            with self.lock:
+        # Determine overall sync state (P0.3)
+        sub_statuses = [v["status"] for v in subsystems.values()]
+        tier_display = "Go Plus" if self.state_mgr.active_tier == "go-plus" else "Go"
+
+        with self.lock:
+            self.sync_state["subsystems"] = subsystems
+            self.sync_state["last_sync"] = now_str
+            self.sync_state["last_sync_timestamp"] = time.time()
+            self.sync_state["items_imported"] = imported_requests
+
+            if all(s == "ok" for s in sub_statuses):
+                msg = f"Live connection active [{tier_display}] ({imported_models} models, {imported_requests} reqs in 5h)"
                 self.sync_state["status"] = "ok"
-                self.sync_state["last_sync"] = now_str
-                self.sync_state["last_sync_timestamp"] = time.time()
-                self.sync_state["items_imported"] = imported_requests
                 self.sync_state["message"] = msg
                 self.sync_state["error_code"] = None
-            return True, msg
-        else:
-            err_msg = "; ".join(errors) if errors else "No data received from cloud."
-            with self.lock:
+                return True, msg
+            elif any(s == "ok" for s in sub_statuses):
+                failed = [k for k, v in subsystems.items() if v["status"] == "error"]
+                err_msg = "; ".join(errors) if errors else "Some endpoints failed."
+                msg = f"Partial sync (Degraded: {', '.join(failed)}): {err_msg}"
+                self.sync_state["status"] = "degraded"
+                self.sync_state["message"] = msg
+                self.sync_state["error_code"] = "DEGRADED"
+                return True, msg
+            else:
+                err_msg = "; ".join(errors) if errors else "No data received from cloud."
                 self.sync_state["status"] = "error"
-                self.sync_state["last_sync"] = now_str
                 self.sync_state["message"] = f"Sync error: {err_msg}"
                 self.sync_state["error_code"] = err_msg
-            return False, self.sync_state["message"]
+                return False, self.sync_state["message"]
 
     def background_worker(self):
         while True:
@@ -866,104 +1175,68 @@ sync_engine = OpenCodeSyncEngine(state)
 # --- HTTP Request Handler ---
 
 class MonitorHandler(http.server.SimpleHTTPRequestHandler):
+    ALLOWED_ORIGINS = {
+        f"http://localhost:{PORT}",
+        f"http://127.0.0.1:{PORT}",
+    }
+
+    def _get_cors_origin(self):
+        origin = self.headers.get("Origin")
+        if origin and origin in self.ALLOWED_ORIGINS:
+            return origin
+        return None
+
+    def _is_request_authorized(self):
+        origin = self.headers.get("Origin")
+        if origin and origin not in self.ALLOWED_ORIGINS:
+            return False, f"Untrusted Origin '{origin}'"
+
+        referer = self.headers.get("Referer")
+        if referer:
+            ref_parsed = urllib.parse.urlparse(referer)
+            ref_origin = f"{ref_parsed.scheme}://{ref_parsed.netloc}"
+            if ref_origin not in self.ALLOWED_ORIGINS:
+                return False, f"Untrusted Referer '{ref_origin}'"
+
+        sec_fetch = self.headers.get("Sec-Fetch-Site")
+        if sec_fetch and sec_fetch not in ("same-origin", "same-site", "none"):
+            return False, f"Cross-site fetch '{sec_fetch}' rejected"
+
+        return True, ""
+
     def do_OPTIONS(self):
+        cors_origin = self._get_cors_origin()
+        if not cors_origin:
+            self.send_error(403, "CORS Forbidden")
+            return
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin", cors_origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-opencode-session")
-        self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.send_header("Vary", "Origin")
         self.end_headers()
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/status":
-            state.clean_sliding_windows()
-            now = time.time()
-            models_data = []
-            alerts = []
-            
-            for m in state.models.values():
-                if m["is_unlimited_5h"]:
-                    pct_5h = 0.0
-                    status_5h = "UNLIMITED"
-                    reset_mins = 0
-                else:
-                    pct_5h = round((m["current_req_5h"] / m["limit_5h_req"]) * 100, 1)
-                    if m.get("timestamps"):
-                        earliest = min(m["timestamps"])
-                        reset_secs = max(0, (earliest + 5 * 3600) - now)
-                        reset_mins = int(reset_secs // 60)
-                    else:
-                        reset_mins = 0
-                
-                if m["is_unlimited_usd"]:
-                    pct_usd = 0.0
-                else:
-                    pct_usd = round((m["current_spent_usd"] / m["limit_monthly_usd"]) * 100, 1)
-
-                max_pct = max(pct_5h, pct_usd)
-                if max_pct >= 85:
-                    risk = "CRITICAL"
-                    alerts.append({
-                        "model": m["name"],
-                        "pct": round(max_pct, 1),
-                        "msg": f"Reached {max_pct:.1f}%! Switch to: {m['escalation_target']}"
-                    })
-                elif max_pct >= 70:
-                    risk = "WARNING"
-                else:
-                    risk = "OK"
-
-                models_data.append({
-                    "id": m["id"],
-                    "name": m["name"],
-                    "role": m["role"],
-                    "category": m["category"],
-                    "categories": m.get("categories", [m["category"]]),
-                    "provider": m["provider"],
-                    "limit_5h_req": m["limit_5h_req"],
-                    "is_unlimited_5h": m["is_unlimited_5h"],
-                    "limit_monthly_usd": int(m["limit_monthly_usd"]) if float(m["limit_monthly_usd"]).is_integer() else round(m["limit_monthly_usd"], 1),
-                    "is_unlimited_usd": m["is_unlimited_usd"],
-                    "current_req_5h": m["current_req_5h"],
-                    "current_spent_usd": round(m["current_spent_usd"], 1),
-                    "pct_5h": round(pct_5h, 1),
-                    "pct_usd": round(pct_usd, 1),
-                    "reset_mins": reset_mins,
-                    "risk": risk,
-                    "escalation_target": m["escalation_target"],
-                    "unit_desc": m["unit_desc"],
-                    "is_limited_time": m.get("is_limited_time", False),
-                    "promo_bonus": m.get("promo_bonus", 1)
-                })
-
-            resp = {
-                "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "total_models": len(models_data),
-                "active_tier": state.active_tier,
-                "tier_mode": state.tier_mode,
-                "alerts": alerts,
-                "models": models_data,
-                "go_status": state.go_status,
-                "cost_summary": state.cost_summary,
-                "sync_state": sync_engine.sync_state
-            }
+            resp = state.get_status_snapshot()
+            resp["sync_state"] = sync_engine.get_sync_state_snapshot()
             self.send_json_response(resp)
             return
 
-        elif parsed.path == "/api/key_status":
+        elif parsed.path in ("/api/key_status", "/api/key/status"):
             key = load_env_key()
             resp = {
                 "configured": bool(key),
                 "masked_key": mask_key(key),
                 "active_tier": state.active_tier,
                 "tier_mode": state.tier_mode,
-                "sync_state": sync_engine.sync_state
+                "sync_state": sync_engine.get_sync_state_snapshot()
             }
             self.send_json_response(resp)
             return
 
-        elif parsed.path == "/" or parsed.path == "/index.html":
+        elif parsed.path in ("/", "/index.html"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
@@ -989,6 +1262,11 @@ class MonitorHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error(404, "Not Found")
 
     def do_POST(self):
+        authorized, reason = self._is_request_authorized()
+        if not authorized:
+            self.send_json_response({"success": False, "error": f"Forbidden: {reason}"}, status_code=403)
+            return
+
         parsed = urllib.parse.urlparse(self.path)
         content_length = int(self.headers.get("Content-Length", 0))
         post_data = self.rfile.read(content_length).decode("utf-8")
@@ -997,7 +1275,15 @@ class MonitorHandler(http.server.SimpleHTTPRequestHandler):
         except Exception:
             payload = {}
 
-        if parsed.path == "/api/save_key":
+        if parsed.path in ("/api/save_key", "/api/key"):
+            action = payload.get("action")
+            if action == "delete":
+                delete_env_key()
+                with sync_engine.lock:
+                    sync_engine.sync_state["status"] = "no_key"
+                    sync_engine.sync_state["message"] = "API key removed."
+                self.send_json_response({"success": True})
+                return
             key = payload.get("api_key", "").strip()
             if not key:
                 self.send_json_response({"success": False, "error": "Az API kulcs mező nem lehet üres!"})
@@ -1009,25 +1295,25 @@ class MonitorHandler(http.server.SimpleHTTPRequestHandler):
                 "sync_success": success,
                 "message": msg,
                 "masked_key": mask_key(key),
-                "sync_state": sync_engine.sync_state
+                "sync_state": sync_engine.get_sync_state_snapshot()
             })
 
         elif parsed.path == "/api/delete_key":
             delete_env_key()
             with sync_engine.lock:
                 sync_engine.sync_state["status"] = "no_key"
-                sync_engine.sync_state["message"] = "API kulcs eltávolítva."
+                sync_engine.sync_state["message"] = "API key removed."
             self.send_json_response({"success": True})
 
-        elif parsed.path == "/api/sync_now":
+        elif parsed.path in ("/api/sync_now", "/api/sync"):
             success, msg = sync_engine.sync_now(force_catalog=True)
             self.send_json_response({
                 "success": success,
                 "message": msg,
-                "sync_state": sync_engine.sync_state
+                "sync_state": sync_engine.get_sync_state_snapshot()
             })
 
-        elif parsed.path == "/api/set_tier":
+        elif parsed.path in ("/api/set_tier", "/api/tier"):
             tier_mode = payload.get("tier_mode", "auto")
             state.set_tier_mode(tier_mode)
             sync_engine.sync_now(force_catalog=True)
@@ -1051,6 +1337,12 @@ class MonitorHandler(http.server.SimpleHTTPRequestHandler):
             success = state.update_model(model_id, req_5h, spent_usd)
             self.send_json_response({"success": success})
 
+        elif parsed.path == "/api/clear_override":
+            model_id = payload.get("model")
+            clear_all = payload.get("all", False)
+            cleared = state.clear_override(model_id, clear_all)
+            self.send_json_response({"success": True, "cleared": cleared})
+
         elif parsed.path == "/api/import_logs":
             count = state.import_logs_data(payload)
             self.send_json_response({"success": True, "imported_count": count})
@@ -1062,14 +1354,18 @@ class MonitorHandler(http.server.SimpleHTTPRequestHandler):
         else:
             self.send_error(404, "Not Found")
 
-    def send_json_response(self, data):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-opencode-session")
-        self.send_header("Access-Control-Allow-Private-Network", "true")
+    def send_json_response(self, data, status_code=200):
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        cors_origin = self._get_cors_origin()
+        if cors_origin:
+            self.send_header("Access-Control-Allow-Origin", cors_origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode("utf-8"))
+        self.wfile.write(body)
 
 def generate_html():
     return """<!DOCTYPE html>
@@ -1412,12 +1708,19 @@ def generate_html():
           if (data.sync_state.status === 'ok') {
             pillDot.className = 'w-2 h-2 rounded-full bg-emerald-400 animate-pulse';
             pillText.innerText = 'Live: ' + data.masked_key;
+            pillText.parentElement.title = data.sync_state.message || 'Connected';
+          } else if (data.sync_state.status === 'degraded') {
+            pillDot.className = 'w-2 h-2 rounded-full bg-amber-400 animate-pulse';
+            pillText.innerText = 'Partial: ' + data.masked_key;
+            pillText.parentElement.title = data.sync_state.message || 'Partial sync';
           } else if (data.sync_state.status === 'error') {
             pillDot.className = 'w-2 h-2 rounded-full bg-red-500';
             pillText.innerText = 'API Error: ' + (data.sync_state.error_code || '403');
+            pillText.parentElement.title = data.sync_state.message || 'Sync error';
           } else {
             pillDot.className = 'w-2 h-2 rounded-full bg-indigo-400';
             pillText.innerText = 'Connected: ' + data.masked_key;
+            pillText.parentElement.title = data.sync_state.message || 'Connected';
           }
         } else {
           deleteBtn.classList.add('hidden');
@@ -2024,7 +2327,7 @@ def run():
     sync_thread = threading.Thread(target=sync_engine.background_worker, daemon=True)
     sync_thread.start()
 
-    with socketserver.TCPServer(("", PORT), handler) as httpd:
+    with socketserver.TCPServer(("127.0.0.1", PORT), handler) as httpd:
         print(f"==================================================")
         print(f"🚀 OpenCode GO & OpenAI v6 Monitor Live!")
         print(f"🌐 Dashboard URL: http://localhost:{PORT}")

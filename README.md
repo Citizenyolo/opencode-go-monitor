@@ -118,21 +118,27 @@ opencode_monitor/
 ```
 
 ### Dependencies
-* **Backend:** Python 3 standard library only (`http.server`, `urllib.request`, `threading`, `json`, `os`, `re`, `datetime`). No `pip install` required.
-* **Frontend:** Single-page application served directly by `server.py`, utilizing Tailwind CSS CDN (v3) with class-based dark mode and custom CSS variables.
+* **Backend:** Python 3 standard library only (`http.server`, `urllib.request`, `threading`, `json`, `os`, `re`, `datetime`). Zero `pip install` required.
+* **Frontend:** Single-page application served directly by `server.py`. Utilizes Tailwind CSS (v3) loaded via CDN (`https://cdn.tailwindcss.com`) with class-based dark mode and custom CSS variables. *(Note: browser internet access is required to fetch the CDN CSS runtime).*
 
 ### HTTP REST API Endpoints
 
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
 | `GET` | `/` | Serves the standalone HTML/JS/CSS dashboard |
-| `GET` | `/api/status` | Returns complete JSON state (models, alerts, go_status, cost_summary, sync_state) |
-| `POST` | `/api/key` | Stores or deletes the OpenCode Console API key in `.env` |
-| `POST` | `/api/key/status` | Returns key existence and masked token (`oc_sk_...`) |
-| `POST` | `/api/sync` | Triggers immediate cloud synchronization |
-| `POST` | `/api/tier` | Sets tier mode (`auto`, `go`, or `go-plus`) |
+| `GET` | `/api/status` | Returns thread-safe JSON state (models, alerts, go_status, cost_summary, sync_state) |
+| `GET`/`POST` | `/api/key_status` *(alias `/api/key/status`)* | Returns key configuration status and masked token (`oc_sk_...`) |
+| `POST` | `/api/save_key` *(alias `/api/key`)* | Stores or updates the OpenCode Console API key in `.env` (preserves all other vars) |
+| `POST` | `/api/delete_key` | Removes the API key from memory and `.env` |
+| `POST` | `/api/sync_now` *(alias `/api/sync`)* | Triggers immediate authoritative cloud synchronization |
+| `POST` | `/api/set_tier` *(alias `/api/tier`)* | Sets tier mode (`auto`, `go`, or `go-plus`) |
 | `POST` | `/api/update` | Manually updates a model's 5h request count or spend |
+| `POST` | `/api/clear_override` | Clears manual override and resumes automatic sliding window updates |
 | `POST` | `/api/record` | Simulates request usage on a model |
+| `POST` | `/api/reset_all` | Resets all local model metrics to 0 |
+
+> [!NOTE]
+> Spend metrics labeled "MTD" query OpenCode's `range=30d` rolling endpoint to reflect the last 30 days of cumulative consumption across all models.
 
 ---
 
