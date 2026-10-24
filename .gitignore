@@ -1,0 +1,23 @@
+# Secrets & Environment
+.env
+*.env
+!.env.example
+
+# Local State & Runtime Cache
+monitor_state.json
+monitor.pid
+*.log
+server.log
+server_err.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# macOS & Editor
+.DS_Store
+.idea/
+.vscode/
+Thumbs.db
