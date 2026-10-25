@@ -598,6 +598,8 @@ class StateManager:
                                 ]:
                                     if attr in v:
                                         self.models[k][attr] = v[attr]
+                                if isinstance(self.models[k].get("timestamps"), list):
+                                    self.models[k]["timestamps"].sort()
                 except Exception as e:
                     print(f"[State] Load error: {e}")
 
