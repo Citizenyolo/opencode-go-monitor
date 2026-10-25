@@ -17,6 +17,7 @@ import urllib.error
 import threading
 import copy
 import re
+import bisect
 from datetime import datetime
 
 PORT = 7890
@@ -597,6 +598,8 @@ class StateManager:
                                 ]:
                                     if attr in v:
                                         self.models[k][attr] = v[attr]
+                                if isinstance(self.models[k].get("timestamps"), list):
+                                    self.models[k]["timestamps"].sort()
                 except Exception as e:
                     print(f"[State] Load error: {e}")
 
@@ -633,7 +636,9 @@ class StateManager:
             five_hours_ago = now - 5 * 3600
             for m in self.models.values():
                 if "timestamps" in m and m["timestamps"]:
-                    m["timestamps"] = [ts for ts in m["timestamps"] if ts > five_hours_ago]
+                    idx = bisect.bisect_right(m["timestamps"], five_hours_ago)
+                    if idx > 0:
+                        m["timestamps"] = m["timestamps"][idx:]
                     if not m.get("manual_override", False):
                         m["current_req_5h"] = len(m["timestamps"])
 
@@ -722,6 +727,7 @@ class StateManager:
                     matched += 1
 
             for k in self.models:
+                model_timestamps[k].sort()
                 self.models[k]["timestamps"] = model_timestamps[k]
                 if not self.models[k].get("manual_override", False):
                     self.models[k]["current_req_5h"] = len(model_timestamps[k])
@@ -759,8 +765,14 @@ class StateManager:
                     
                     if started_at > five_hours_ago:
                         m["timestamps"].append(started_at)
-                        m["current_req_5h"] = len(m["timestamps"])
                     imported_count += 1
+
+            for k in self.models:
+                m = self.models[k]
+                if m["timestamps"]:
+                    m["timestamps"].sort()
+                    if not m.get("manual_override", False):
+                        m["current_req_5h"] = len(m["timestamps"])
 
             self.save()
             return imported_count
@@ -790,7 +802,7 @@ class StateManager:
                 else:
                     pct_5h = round((m["current_req_5h"] / m["limit_5h_req"]) * 100, 1)
                     if m.get("timestamps"):
-                        earliest = min(m["timestamps"])
+                        earliest = m["timestamps"][0]
                         reset_secs = max(0, (earliest + 5 * 3600) - now)
                         reset_mins = int(reset_secs // 60)
                     else:
